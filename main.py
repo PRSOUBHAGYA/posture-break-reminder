@@ -1,0 +1,297 @@
+"""
+Main entry point for PostureGuard.
+Integrates Camera, Analyser, AlertManager, SessionTimer, and the Rumps menu bar app.
+"""
+
+import rumps
+import threading
+import logging
+import os
+from config import load_config, save_config, CONFIG_FILE
+from camera import CameraModule
+from posture_analyser import PostureAnalyser
+from alert_manager import AlertManager
+from session_timer import SessionTimer
+from ui.calibration_ui import CalibrationUI
+from ui.overlay import PostureWarningOverlay
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PostureGuard")
+
+class PostureGuardApp(rumps.App):
+    def __init__(self):
+        super().__init__("PostureGuard")
+
+        # Load configuration
+        self.config = load_config()
+
+        # Core components
+        self.analyser = PostureAnalyser()
+        self.alert_manager = AlertManager(overlay_class=PostureWarningOverlay)
+
+        # Session Timer setup
+        self.session_timer = SessionTimer(
+            on_break_complete=self.on_break_complete,
+            on_break_trigger=self.trigger_walk_ui,
+            lock_callback=self.alert_manager.lock_screen
+        )
+
+        # Camera setup
+        self.camera = CameraModule(
+            callback=self.process_frame,
+            interval=self.config['timers']['camera_check_interval_seconds']
+        )
+
+        # Debug window buffer
+        self.debug_frame_buffer = None
+
+        # Menu setup
+        self.menu = [
+            rumps.MenuItem("Status: Initializing...", callback=None),
+            rumps.MenuItem("Session: 00:00", callback=None),
+            None,
+            rumps.MenuItem("Pause Monitoring", callback=self.toggle_monitoring),
+            rumps.MenuItem("Re-Calibrate", callback=self.run_calibration),
+            rumps.MenuItem("Debug View", callback=self.toggle_debug_view),
+            None,
+            rumps.MenuItem("Quit PostureGuard", callback=self.quit_app),
+        ]
+
+        # Set initial title instead of icon, as rumps.App.icon expects a file path
+        self.title = "⏸"
+
+    def on_break_complete(self):
+        """Callback for when the walk break is finished."""
+        logger.info("Walk break completed. Resuming monitoring.")
+        self.session_timer.notify_break_finished()
+        self.resume_monitoring()
+
+    def trigger_walk_ui(self):
+        """Launched by session_timer to show the walk break window."""
+        from ui.walk_reminder import WalkReminderWindow
+        logger.info("Launching walk reminder UI.")
+        threading.Thread(
+            target=lambda: WalkReminderWindow(on_resume_callback=self.on_break_complete).show(),
+            daemon=True
+        ).start()
+
+    def process_frame(self, frame):
+        """Callback invoked by CameraModule every 2 seconds."""
+        try:
+            result = self.analyser.analyze_frame(
+                frame,
+                self.config['calibration'],
+                self.config['thresholds']
+            )
+
+            # Update alert manager (handles timers and locking)
+            self.alert_manager.update(result)
+
+            # Debug Overlay Logic
+            if self.config['ui'].get('show_debug_overlay', False):
+                self.show_debug_window(frame, result)
+
+            # Update UI components (must be done on main thread for rumps)
+            self.update_ui_status(result)
+
+        except Exception as e:
+            logger.error(f"Error processing frame: {e}")
+
+    def show_debug_window(self, frame, result):
+        """Prepares the debug frame and stores it in the buffer."""
+        import cv2
+        import mediapipe as mp
+
+        try:
+            # Create a copy to avoid modifying the original frame
+            debug_frame = frame.copy()
+
+            # Draw landmarks
+            mp_drawing = mp.solutions.drawing_utils
+            mp_pose = mp.solutions.pose
+
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.analyser.pose.process(image_rgb)
+
+            if res.pose_landmarks:
+                mp_drawing.draw_landmarks(
+                    debug_frame, res.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+            # Draw status and checks
+            y0, x0 = 30, 10
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            # Overall Status
+            color = (0, 255, 0) if result.status == "GOOD" else (0, 0, 255) if result.status == "BAD" else (255, 255, 255)
+            cv2.putText(debug_frame, f"STATUS: {result.status}", (x0, y0), font, 1, color, 2, cv2.LINE_AA)
+
+            # Individual Checks
+            y_offset = 70
+            for check, passed in result.checks.items():
+                check_color = (0, 255, 0) if not passed else (0, 0, 255) # SRD: bad if True, so passed if False
+                text = f"{check}: {'PASS' if not passed else 'FAIL'}"
+                cv2.putText(debug_frame, text, (x0, y_offset), font, 0.6, check_color, 1, cv2.LINE_AA)
+                y_offset += 30
+
+            # Store in buffer instead of calling cv2.imshow directly
+            self.debug_frame_buffer = debug_frame
+        except Exception as e:
+            logger.error(f"Debug frame preparation error: {e}")
+
+    def update_ui_status(self, result):
+        """Updates the menu bar icon and text based on posture result."""
+        if self.alert_manager.is_paused:
+            self.title = "⏸"
+        elif result.status == "BAD":
+            if self.alert_manager.bad_posture_start_time is not None:
+                self.title = "⚠️"
+            else:
+                self.title = "✅"
+        elif result.status == "GOOD":
+            self.title = "✅"
+        else: # UNKNOWN
+            self.title = "⚪"
+
+        status_text = f"Status: {result.status}"
+        seconds = self.session_timer.cumulative_seconds
+        mins, secs = divmod(seconds, 60)
+        hours, mins = divmod(mins, 60)
+        session_text = f"Session: {hours:02d}:{mins:02d}:{secs:02d}"
+
+        for item in self.menu:
+            if item and hasattr(item, 'title'):
+                current_title = item.title
+                # Ensure current_title is a string before using 'in'
+                if isinstance(current_title, str):
+                    if "Status:" in current_title:
+                        item.title = status_text
+                    elif "Session:" in current_title:
+                        item.title = session_text
+
+    def toggle_monitoring(self):
+        """Toggles the monitoring state between paused and active."""
+        if self.alert_manager.is_paused:
+            self.resume_monitoring()
+        else:
+            self.pause_monitoring()
+
+    def pause_monitoring(self):
+        self.alert_manager.pause()
+        self.session_timer.pause()
+        for item in self.menu:
+            if item and item.title == "Pause Monitoring":
+                item.title = "Resume Monitoring"
+        self.title = "⏸"
+        logger.info("Monitoring paused.")
+
+    def resume_monitoring(self):
+        self.alert_manager.resume()
+        self.session_timer.resume()
+        for item in self.menu:
+            if item and item.title == "Resume Monitoring":
+                item.title = "Pause Monitoring"
+        logger.info("Monitoring resumed.")
+
+    def toggle_debug_view(self, _):
+        """Toggles the debug overlay setting in config and updates UI."""
+        current = self.config['ui'].get('show_debug_overlay', False)
+        self.config['ui']['show_debug_overlay'] = not current
+        save_config(self.config)
+
+        # Find the Debug View menu item and update its label
+        for item in self.menu:
+            if item and hasattr(item, 'title'):
+                current_title = item.title
+                if isinstance(current_title, str) and "Debug View" in current_title:
+                    status = "ON" if self.config['ui']['show_debug_overlay'] else "OFF"
+                    item.title = f"Debug View ({status})"
+
+        logger.info(f"Debug view toggled to: {self.config['ui']['show_debug_overlay']}")
+
+    def quit_app(self, _):
+        """Cleanly stops all background threads and exits."""
+        logger.info("Quitting PostureGuard...")
+
+        # Close OpenCV windows if they exist
+        import cv2
+        cv2.destroyAllWindows()
+
+        self.camera.stop()
+        self.session_timer.stop()
+        rumps.app.quit(self)
+
+    def run_calibration(self, _=None):
+        """Opens the calibration wizard."""
+        self.pause_monitoring()
+        self._start_calibration_ui()
+
+    def _start_calibration_ui(self):
+        cal_ui = CalibrationUI(self.camera, self.analyser)
+        cal_ui.run()
+        # Refresh config after calibration
+        self.config = load_config()
+        self.resume_monitoring()
+
+    def start_app(self):
+        """Initializes all modules and starts the app."""
+        try:
+            # 1. Check for first-run calibration
+            if not os.path.exists(CONFIG_FILE):
+                logger.info("First run detected. Starting calibration.")
+                self.camera.start()
+                self.run_calibration()
+            else:
+                # Normal startup
+                self.camera.start()
+                self.session_timer.start()
+                self.resume_monitoring()
+
+            # Start a timer to handle OpenCV imshow on the main thread
+            self.debug_timer = rumps.Timer(self._update_debug_window, 30)
+            self.debug_timer.start()
+        except RuntimeError as e:
+            logger.error(f"Critical startup error: {e}")
+            self._handle_startup_error(str(e))
+        except Exception as e:
+            logger.error(f"Unexpected startup error: {e}")
+            self._handle_startup_error(str(e))
+
+    def _update_debug_window(self, _):
+        """Main-thread callback to refresh the OpenCV debug window."""
+        if self.config['ui'].get('show_debug_overlay', False) and self.debug_frame_buffer is not None:
+            import cv2
+            cv2.imshow("PostureGuard Debug View", self.debug_frame_buffer)
+            cv2.waitKey(1)
+
+    def _handle_startup_error(self, error_msg):
+        """Displays error dialog and quits the app if camera is unavailable."""
+        import tkinter as tk
+        from tkinter import messagebox
+        import webbrowser
+
+        # Identify if it's a camera/permission issue
+        if "camera" in error_msg.lower() or "Could not open" in error_msg:
+            # Try to open System Settings Privacy Camera page
+            webbrowser.open("x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")
+
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Camera Error",
+                f"PostureGuard cannot access the camera:\n{error_msg}\n\n"
+                "Please ensure the camera is connected and permissions are granted in System Settings."
+            )
+            root.destroy()
+            logger.info("Critical camera error. Exiting app.")
+            os._exit(1)
+        else:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Startup Error", f"An unexpected error occurred:\n{error_msg}")
+            root.destroy()
+
+if __name__ == "__main__":
+    app = PostureGuardApp()
+    app.start_app()
+    app.run()
