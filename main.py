@@ -159,17 +159,19 @@ class PostureGuardApp(rumps.App):
         hours, mins = divmod(mins, 60)
         session_text = f"Session: {hours:02d}:{mins:02d}:{secs:02d}"
 
+        # Robust update: match items by content and update them
         for item in self.menu:
-            if item and hasattr(item, 'title'):
-                current_title = item.title
-                # Ensure current_title is a string before using 'in'
-                if isinstance(current_title, str):
-                    if "Status:" in current_title:
-                        item.title = status_text
-                    elif "Session:" in current_title:
-                        item.title = session_text
+            if not item or not hasattr(item, 'title'):
+                continue
 
-    def toggle_monitoring(self):
+            current_title = item.title
+            if isinstance(current_title, str):
+                if current_title.startswith("Status:"):
+                    item.title = status_text
+                elif current_title.startswith("Session:"):
+                    item.title = session_text
+
+    def toggle_monitoring(self, _):
         """Toggles the monitoring state between paused and active."""
         if self.alert_manager.is_paused:
             self.resume_monitoring()
@@ -180,8 +182,9 @@ class PostureGuardApp(rumps.App):
         self.alert_manager.pause()
         self.session_timer.pause()
         for item in self.menu:
-            if item and item.title == "Pause Monitoring":
-                item.title = "Resume Monitoring"
+            if item and hasattr(item, 'title') and isinstance(item.title, str):
+                if item.title == "Pause Monitoring":
+                    item.title = "Resume Monitoring"
         self.title = "⏸"
         logger.info("Monitoring paused.")
 
@@ -189,8 +192,9 @@ class PostureGuardApp(rumps.App):
         self.alert_manager.resume()
         self.session_timer.resume()
         for item in self.menu:
-            if item and item.title == "Resume Monitoring":
-                item.title = "Pause Monitoring"
+            if item and hasattr(item, 'title') and isinstance(item.title, str):
+                if item.title == "Resume Monitoring":
+                    item.title = "Pause Monitoring"
         logger.info("Monitoring resumed.")
 
     def toggle_debug_view(self, _):
@@ -223,15 +227,33 @@ class PostureGuardApp(rumps.App):
 
     def run_calibration(self, _=None):
         """Opens the calibration wizard."""
+        logger.info("User requested re-calibration.")
         self.pause_monitoring()
+        # Ensure camera is running before showing UI
+        if not self.camera.running:
+            try:
+                self.camera.start()
+            except Exception as e:
+                logger.error(f"Could not start camera for calibration: {e}")
+                self.resume_monitoring()
+                return
+
         self._start_calibration_ui()
 
     def _start_calibration_ui(self):
-        cal_ui = CalibrationUI(self.camera, self.analyser)
-        cal_ui.run()
-        # Refresh config after calibration
-        self.config = load_config()
-        self.resume_monitoring()
+        """Helper to run the calibration UI and handle the aftermath."""
+        try:
+            # Create and run the calibration UI
+            cal_ui = CalibrationUI(self.camera, self.analyser)
+            cal_ui.run()
+
+            # After the window is closed, refresh config and resume
+            logger.info("Calibration window closed. Refreshing configuration.")
+            self.config = load_config()
+            self.resume_monitoring()
+        except Exception as e:
+            logger.error(f"Calibration UI error: {e}")
+            self.resume_monitoring()
 
     def start_app(self):
         """Initializes all modules and starts the app."""
@@ -239,6 +261,7 @@ class PostureGuardApp(rumps.App):
             # 1. Check for first-run calibration
             if not os.path.exists(CONFIG_FILE):
                 logger.info("First run detected. Starting calibration.")
+                # Start camera first so calibration UI has a feed
                 self.camera.start()
                 self.run_calibration()
             else:
@@ -248,7 +271,19 @@ class PostureGuardApp(rumps.App):
                 self.resume_monitoring()
 
             # Start a timer to handle OpenCV imshow on the main thread
-            self.debug_timer = rumps.Timer(self._update_debug_window, 30)
+            # Reduced interval to 10ms for a smooth, near-constant refresh rate
+            self.debug_timer = rumps.Timer(self._update_debug_window, 0.01)
+            self.debug_timer.start()
+        except RuntimeError as e:
+            logger.error(f"Critical startup error: {e}")
+            self._handle_startup_error(str(e))
+        except Exception as e:
+            logger.error(f"Unexpected startup error: {e}")
+            self._handle_startup_error(str(e))
+
+            # Start a timer to handle OpenCV imshow on the main thread
+            # Reduced interval to 10ms for a smooth, near-constant refresh rate
+            self.debug_timer = rumps.Timer(self._update_debug_window, 0.01)
             self.debug_timer.start()
         except RuntimeError as e:
             logger.error(f"Critical startup error: {e}")

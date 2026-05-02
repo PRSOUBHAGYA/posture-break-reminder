@@ -95,12 +95,16 @@ class PostureAnalyser:
         asymmetry_bad = shoulder_diff > thresholds['shoulder_asymmetry_threshold']
 
         # --- Check 4: Head Tilt ---
-        # Angle between ears relative to horizontal
+        # Difference between current angle and baseline angle
         dx = r_ear.x - l_ear.x
         dy = r_ear.y - l_ear.y
         angle_rad = np.arctan2(dy, dx)
         angle_deg = abs(np.degrees(angle_rad))
-        tilt_bad = angle_deg > thresholds['head_tilt_threshold_degrees']
+
+        # Calculate tilt relative to baseline
+        baseline_tilt = baseline.get('head_tilt_baseline_degrees', 0)
+        tilt_diff = abs(angle_deg - baseline_tilt)
+        tilt_bad = tilt_diff > thresholds['head_tilt_threshold_degrees']
 
         checks = {
             "head_lean": head_lean_bad,
