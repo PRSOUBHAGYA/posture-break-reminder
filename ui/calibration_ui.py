@@ -89,12 +89,19 @@ class CalibrationUI:
 
     def _calibration_thread(self):
         """Handles the countdown and landmark data collection."""
+        # 1. Countdown period (where we don't capture yet, just wait)
         for i in range(5, 0, -1):
-            self.countdown_label.config(text=f"Capturing in... {i}")
+            self.countdown_label.config(text=f"Get ready... {i}")
             time.sleep(1)
-            # Capture a frame during the countdown
+
+        self.countdown_label.config(text="Capturing! Stay still...")
+
+        # 2. Actual capture period (e.g., 3 seconds of frames)
+        start_time = time.time()
+        while time.time() - start_time < 3:
             if self.last_frame is not None:
                 self.calibrator.add_frame_data(self.last_frame)
+            time.sleep(0.1) # Sample at ~10fps
 
         self.countdown_label.config(text="Processing...")
 

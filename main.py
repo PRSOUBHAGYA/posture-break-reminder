@@ -19,6 +19,33 @@ from ui.overlay import PostureWarningOverlay
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PostureGuard")
 
+def _run_calibration_worker():
+    """Standalone worker function for multiprocessing.
+    Must be defined at top-level to be picklable.
+    """
+    try:
+        from ui.calibration_ui import CalibrationUI
+        from camera import CameraModule
+        from posture_analyser import PostureAnalyser
+        import logging
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("CalibrationWorker")
+
+        cam = CameraModule(callback=lambda x: None)
+        cam.start()
+        analyser = PostureAnalyser()
+
+        cal_ui = CalibrationUI(cam, analyser)
+        cal_ui.run()
+    except Exception as e:
+        print(f"Calibration process error: {e}")
+    finally:
+        try:
+            cam.stop()
+        except:
+            pass
+
 class PostureGuardApp(rumps.App):
     def __init__(self):
         super().__init__("PostureGuard")
@@ -53,7 +80,7 @@ class PostureGuardApp(rumps.App):
             None,
             rumps.MenuItem("Pause Monitoring", callback=self.toggle_monitoring),
             rumps.MenuItem("Re-Calibrate", callback=self.run_calibration),
-            rumps.MenuItem("Debug View", callback=self.toggle_debug_view),
+            rumps.MenuItem(f"Debug View ({'ON' if self.config['ui'].get('show_debug_overlay', False) else 'OFF'})", callback=self.toggle_debug_view),
             None,
             rumps.MenuItem("Quit PostureGuard", callback=self.quit_app),
         ]
@@ -228,20 +255,52 @@ class PostureGuardApp(rumps.App):
     def run_calibration(self, _=None):
         """Opens the calibration wizard."""
         logger.info("User requested re-calibration.")
+
         self.pause_monitoring()
-        # Ensure camera is running before showing UI
-        if not self.camera.running:
+
+        # We use multiprocessing to avoid macOS Tkinter threading crashes.
+        # The worker must be a top-level function to be picklable.
+        import multiprocessing
+        p = multiprocessing.Process(target=_run_calibration_worker)
+        p.start()
+
+        # Start a timer to monitor the process and resume monitoring when it ends
+        self.calib_watch_timer = rumps.Timer(lambda _: self._check_calibration_status(p), 1.0)
+        self.calib_watch_timer.start()
+
+    def _run_calibration_process(self):
+        """Standalone process entry point to run calibration UI."""
+        try:
+            # Re-initialize necessary components for the new process
+            # Note: Camera and Analyser need to be compatible with multiprocessing
+            from ui.calibration_ui import CalibrationUI
+            from camera import CameraModule
+            from posture_analyser import PostureAnalyser
+
+            cam = CameraModule(callback=lambda x: None)
+            cam.start()
+            analyser = PostureAnalyser()
+
+            cal_ui = CalibrationUI(cam, analyser)
+            cal_ui.run()
+
+            # Note: Since this is a separate process, it cannot directly
+            # update the main app's config object in memory.
+            # calibration_ui.run() already saves the config to disk via save_config().
+        except Exception as e:
+            print(f"Calibration process error: {e}")
+        finally:
+            # Clean up camera in the process
             try:
-                self.camera.start()
-            except Exception as e:
-                logger.error(f"Could not start camera for calibration: {e}")
-                self.resume_monitoring()
-                return
+                cam.stop()
+            except:
+                pass
 
-        self._start_calibration_ui()
+    def _start_calibration_ui_main(self, _):
+        """Main-thread wrapper to launch the calibration UI."""
+        # Stop the timer so it only runs once
+        self.calibration_timer.stop()
 
-    def _start_calibration_ui(self):
-        """Helper to run the calibration UI and handle the aftermath."""
         try:
             # Create and run the calibration UI
             cal_ui = CalibrationUI(self.camera, self.analyser)
@@ -250,10 +309,14 @@ class PostureGuardApp(rumps.App):
             # After the window is closed, refresh config and resume
             logger.info("Calibration window closed. Refreshing configuration.")
             self.config = load_config()
+
+            # Ensure camera callback is restored and monitoring starts
             self.resume_monitoring()
+            self.session_timer.resume()
         except Exception as e:
             logger.error(f"Calibration UI error: {e}")
             self.resume_monitoring()
+            self.session_timer.resume()
 
     def start_app(self):
         """Initializes all modules and starts the app."""
@@ -298,6 +361,18 @@ class PostureGuardApp(rumps.App):
             import cv2
             cv2.imshow("PostureGuard Debug View", self.debug_frame_buffer)
             cv2.waitKey(1)
+
+    def _check_calibration_status(self, process):
+        """Polls the calibration process and resumes monitoring when it exits."""
+        if not process.is_alive():
+            logger.info("Calibration process ended. Resuming monitoring.")
+            self.calib_watch_timer.stop()
+            self.config = load_config() # Refresh baselines from disk
+            self.resume_monitoring()
+            self.session_timer.resume()
+        else:
+            # Process is still running, keep the timer going
+            pass
 
     def _handle_startup_error(self, error_msg):
         """Displays error dialog and quits the app if camera is unavailable."""
