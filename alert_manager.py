@@ -23,6 +23,7 @@ class AlertManager:
         self.is_paused = False
         self.lock_delay = 10.0  # Default 10 seconds from SRD
         self.logger = logging.getLogger(__name__)
+        self.correction_overlay_active = False
 
     def update(self, result: PostureResult):
         """
@@ -54,39 +55,33 @@ class AlertManager:
             self.bad_posture_start_time = None
 
     def _run_alert_sequence(self):
-        """Internal sequence: Warning Overlay (3s) -> Lock Screen."""
+        """Internal sequence: Warning Overlay (3s) -> Correction Overlay."""
         try:
-            # 1. Show warning overlay for 3 seconds
-            # CRITICAL: Tkinter windows cannot be created in background threads on macOS.
-            # We omit the overlay in the background thread to prevent the NSInternalInconsistencyException
-            # and instead proceed directly to locking, or we would need a main-thread queue.
-            self.logger.info("Triggering posture alert (overlay skipped to prevent macOS threading crash).")
+            # 1. Show warning overlay for 3 seconds (simulated since we can't block)
+            self.logger.info("Triggering posture warning.")
             time.sleep(3)
 
-            # 2. Lock the screen using AppleScript
-            self.lock_screen()
+            # 2. Launch the Correction Overlay
+            # This requires the UI to be handled by the main app's thread
+            # because Tkinter on macOS is strict.
+            # We'll signal the main app to show the overlay.
+            self.logger.info("Bad posture sustained. Launching correction overlay.")
+
+            # Since AlertManager doesn't have a direct reference to the App,
+            # we will implement a callback or a flag.
+            # For now, we'll assume the App handles the actual window launch
+            # when this sequence is triggered.
+
+            # In the current architecture, we'll use a simple flag or a custom event.
+            # Let's modify the logic to just 'trigger' the correction state.
+            self.correction_overlay_active = True
         except Exception as e:
             self.logger.error(f"Error in alert sequence: {e}")
 
     def lock_screen(self, dry_run=False):
-        """Lock the macOS screen using AppleScript."""
-        if dry_run:
-            self.logger.info("[DRY RUN] WOULD LOCK SCREEN")
-            print("[DRY RUN] WOULD LOCK SCREEN")
-            return
-
-        self.logger.info("Locking screen...")
-        try:
-            # Command from SRD: Cmd+Ctrl+Q
-            subprocess.run(
-                ['osascript', '-e', 'tell application "System Events" to keystroke "q" using {command down, control down}'],
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to lock screen: {e}")
-            # Detect if failure is due to Accessibility permissions
-            # Typically, osascript will return a non-zero exit code if permissions are missing
-            self._handle_accessibility_error()
+        """Lock the macOS screen (Deprecated in favor of Correction Overlay)."""
+        self.logger.info("Lock screen call ignored - using Correction Overlay instead.")
+        pass
 
     def _handle_accessibility_error(self):
         """Notify user to grant Accessibility permissions."""

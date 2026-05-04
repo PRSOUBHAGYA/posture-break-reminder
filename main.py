@@ -14,6 +14,7 @@ from alert_manager import AlertManager
 from session_timer import SessionTimer
 from ui.calibration_ui import CalibrationUI
 from ui.overlay import PostureWarningOverlay
+from ui.correction_overlay import PostureCorrectionOverlay
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +46,17 @@ def _run_calibration_worker():
             cam.stop()
         except:
             pass
+
+def _run_correction_worker():
+    """Standalone worker function for the correction overlay.
+    Must be defined at top-level to be picklable.
+    """
+    try:
+        from ui.correction_overlay import PostureCorrectionOverlay
+        overlay = PostureCorrectionOverlay()
+        overlay.show()
+    except Exception as e:
+        print(f"Correction overlay process error: {e}")
 
 class PostureGuardApp(rumps.App):
     def __init__(self):
@@ -112,15 +124,41 @@ class PostureGuardApp(rumps.App):
                 self.config['thresholds']
             )
 
-            # Update alert manager (handles timers and locking)
+            # Update alert manager (handles timers and triggering correction state)
             self.alert_manager.update(result)
+
+            # --- Correction Overlay Logic ---
+            if self.alert_manager.correction_overlay_active:
+                if not hasattr(self, 'correction_process') or not self.correction_process.is_alive():
+                    logger.info("Launching correction overlay.")
+                    import multiprocessing
+                    p = multiprocessing.Process(target=_run_correction_worker)
+                    p.start()
+                    self.correction_process = p
+
+                    self.correction_watch_timer = rumps.Timer(lambda _: self._check_correction_status(result), 1.0)
+                    self.correction_watch_timer.start()
+
+            if self.alert_manager.correction_overlay_active and result.status == "GOOD":
+                self.alert_manager.correction_overlay_active = False
+                if hasattr(self, 'correction_process') and self.correction_process.is_alive():
+                    self.correction_process.terminate()
+                if hasattr(self, 'correction_watch_timer'):
+                    self.correction_watch_timer.stop()
+                logger.info("Posture corrected. Closing overlay.")
 
             # Debug Overlay Logic
             if self.config['ui'].get('show_debug_overlay', False):
                 self.show_debug_window(frame, result)
 
-            # Update UI components (must be done on main thread for rumps)
-            self.update_ui_status(result)
+            # UI Updates: Use a separate thread-safe method
+            # Instead of creating a new Timer every frame, which can be unreliable in rumps,
+            # we'll use a simple threading.Timer or a scheduled call if rumps.Timer is struggling.
+            # But for now, let's try the most direct rumps-supported way to ensure it hits the main thread.
+            try:
+                rumps.Timer(lambda _: self.update_ui_status(result), 0.01).start()
+            except Exception as ui_e:
+                logger.error(f"UI update dispatch error: {ui_e}")
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")
@@ -168,11 +206,19 @@ class PostureGuardApp(rumps.App):
 
     def update_ui_status(self, result):
         """Updates the menu bar icon and text based on posture result."""
+        # Handle paused state first
         if self.alert_manager.is_paused:
             self.title = "⏸"
         elif result.status == "BAD":
+            # If bad posture has persisted long enough to trigger the alert manager's threshold, show warning
             if self.alert_manager.bad_posture_start_time is not None:
-                self.title = "⚠️"
+                # Check if the current time exceeds the threshold
+                import time
+                elapsed = time.time() - self.alert_manager.bad_posture_start_time
+                if elapsed >= self.config['thresholds']['bad_posture_threshold_seconds']:
+                    self.title = "⚠️"
+                else:
+                    self.title = "✅"
             else:
                 self.title = "✅"
         elif result.status == "GOOD":
@@ -296,6 +342,17 @@ class PostureGuardApp(rumps.App):
             except:
                 pass
 
+    def _check_correction_status(self, result):
+        """Checks if posture is corrected to close the overlay."""
+        if result.status == "GOOD":
+            self.alert_manager.correction_overlay_active = False
+            if hasattr(self, 'correction_process') and self.correction_process.is_alive():
+                self.correction_process.terminate()
+            if hasattr(self, 'correction_watch_timer'):
+                self.correction_watch_timer.stop()
+            logger.info("Posture corrected. Closing overlay.")
+
+
     def _start_calibration_ui_main(self, _):
         """Main-thread wrapper to launch the calibration UI."""
         # Stop the timer so it only runs once
@@ -332,17 +389,6 @@ class PostureGuardApp(rumps.App):
                 self.camera.start()
                 self.session_timer.start()
                 self.resume_monitoring()
-
-            # Start a timer to handle OpenCV imshow on the main thread
-            # Reduced interval to 10ms for a smooth, near-constant refresh rate
-            self.debug_timer = rumps.Timer(self._update_debug_window, 0.01)
-            self.debug_timer.start()
-        except RuntimeError as e:
-            logger.error(f"Critical startup error: {e}")
-            self._handle_startup_error(str(e))
-        except Exception as e:
-            logger.error(f"Unexpected startup error: {e}")
-            self._handle_startup_error(str(e))
 
             # Start a timer to handle OpenCV imshow on the main thread
             # Reduced interval to 10ms for a smooth, near-constant refresh rate
