@@ -151,14 +151,10 @@ class PostureGuardApp(rumps.App):
             if self.config['ui'].get('show_debug_overlay', False):
                 self.show_debug_window(frame, result)
 
-            # UI Updates: Use a separate thread-safe method
-            # Instead of creating a new Timer every frame, which can be unreliable in rumps,
-            # we'll use a simple threading.Timer or a scheduled call if rumps.Timer is struggling.
-            # But for now, let's try the most direct rumps-supported way to ensure it hits the main thread.
-            try:
-                rumps.Timer(lambda _: self.update_ui_status(result), 0.01).start()
-            except Exception as ui_e:
-                logger.error(f"UI update dispatch error: {ui_e}")
+            # UI Updates:
+            # We'll set the latest result on the app instance and let a dedicated
+            # main-thread timer handle the UI update to avoid all thread-dispatch issues.
+            self.last_posture_result = result
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")
@@ -210,17 +206,8 @@ class PostureGuardApp(rumps.App):
         if self.alert_manager.is_paused:
             self.title = "⏸"
         elif result.status == "BAD":
-            # If bad posture has persisted long enough to trigger the alert manager's threshold, show warning
-            if self.alert_manager.bad_posture_start_time is not None:
-                # Check if the current time exceeds the threshold
-                import time
-                elapsed = time.time() - self.alert_manager.bad_posture_start_time
-                if elapsed >= self.config['thresholds']['bad_posture_threshold_seconds']:
-                    self.title = "⚠️"
-                else:
-                    self.title = "✅"
-            else:
-                self.title = "✅"
+            # Immediately show alert icon when bad posture is detected
+            self.title = "⚠️"
         elif result.status == "GOOD":
             self.title = "✅"
         else: # UNKNOWN
@@ -394,12 +381,29 @@ class PostureGuardApp(rumps.App):
             # Reduced interval to 10ms for a smooth, near-constant refresh rate
             self.debug_timer = rumps.Timer(self._update_debug_window, 0.01)
             self.debug_timer.start()
+
+            # NEW: Dedicated UI heartbeat timer
+            # This runs on the main thread every 0.5 seconds and updates the menu bar
+            # based on the most recent result from the camera thread.
+            self.ui_heartbeat_timer = rumps.Timer(self._ui_heartbeat, 0.5)
+            self.ui_heartbeat_timer.start()
+
         except RuntimeError as e:
             logger.error(f"Critical startup error: {e}")
             self._handle_startup_error(str(e))
         except Exception as e:
             logger.error(f"Unexpected startup error: {e}")
             self._handle_startup_error(str(e))
+
+    def _ui_heartbeat(self, _):
+        """Main-thread timer callback to update the UI using the last known result."""
+        if hasattr(self, 'last_posture_result'):
+            self.update_ui_status(self.last_posture_result)
+        else:
+            # Default to a neutral state if no results have come in yet
+            # This avoids the app starting with a "paused" icon if monitoring is active
+            if not self.alert_manager.is_paused:
+                self.title = "⚪"
 
     def _update_debug_window(self, _):
         """Main-thread callback to refresh the OpenCV debug window."""
